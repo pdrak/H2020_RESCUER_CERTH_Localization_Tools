@@ -1,0 +1,75 @@
+64a65
+> bool do_exit = false;
+238c239,240
+<     while (cap->isOpened())
+---
+>     //while (!do_exit && cap->isOpened())
+>     while(cap->isOpened())
+239a242,243
+> 	if(!do_exit) break;
+> 
+277a282,283
+>     //std::unique_lock<std::mutex> lck(mtx);
+> 
+500c506,517
+<                 break;
+---
+> 	        do_exit = true;
+> 
+> 	        if(enable_ultra_debug)
+> 	            spdlog::info("equirectangular_tracking() releasing memory resources");
+> 
+> 	        free_matrix_double(map_b);
+>                 free_matrix_int(map_x_0);
+>                 free_matrix_int(map_y_0);
+>                 free_matrix_int(map_x_1);
+>                 free_matrix_int(map_y_1);
+> 
+> 	        break;
+597,605d613
+< 	}
+< 
+<         // wait until the loop BA is finished
+<         while (slam->loop_BA_is_running()) {
+<             std::this_thread::sleep_for(std::chrono::microseconds(5000));
+<         }
+<         
+< 	if(enable_ultra_debug)
+< 	    spdlog::info("equirectangular_tracking() releasing memory resources");
+607,612c615,620
+< 	free_matrix_double(map_b);
+<         free_matrix_int(map_x_0);
+<         free_matrix_int(map_y_0);
+<         free_matrix_int(map_x_1);
+<         free_matrix_int(map_y_1);
+<     });
+---
+>     	    // wait until the loop BA is finished
+>             if (slam->loop_BA_is_running()) {
+>                 std::this_thread::sleep_for(std::chrono::microseconds(5000));
+>             }
+> 	}
+>    });
+627c635
+<     capThread.join();
+---
+>  
+629c637,639
+< 
+---
+>  
+>     capThread.join();
+>  
+632c642
+< 
+---
+>  
+641a652
+> 	spdlog::info("map database saved under {}", map_db_path);
+933a945
+>     
+1003c1015,1016
+< 
+---
+>     
+>     spdlog::info("quitting run_camera_slam");

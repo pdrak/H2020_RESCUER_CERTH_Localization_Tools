@@ -1,0 +1,1016 @@
+#ifdef USE_PANGOLIN_VIEWER
+#include "pangolin_viewer/viewer.h"
+#elif USE_SOCKET_PUBLISHER
+#include "socket_publisher/publisher.h"
+#endif
+
+#include "stella_vslam/system.h"
+#include "stella_vslam/config.h"
+#include "stella_vslam/camera/base.h"
+#include "stella_vslam/util/stereo_rectifier.h"
+#include "stella_vslam/util/yaml.h"
+
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <condition_variable>
+#include <numeric>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#include <curl/curl.h>
+
+#include <boost/exception/exception.hpp>
+#include <boost/thread.hpp>
+#include <boost/chrono.hpp>
+#include <boost/system/config.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/asio.hpp>
+
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui.hpp>
+
+#include <opencv2/core/mat.hpp>
+#include <opencv2/core/types.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+#include <spdlog/spdlog.h>
+#include <popl.hpp>
+
+#include <jsoncpp/json/json.h>
+
+#include <ghc/filesystem.hpp>
+namespace fs = ghc::filesystem;
+
+#ifdef USE_STACK_TRACE_LOGGER
+#include <backward.hpp>
+#endif
+
+#ifdef USE_GOOGLE_PERFTOOLS
+#include <gperftools/profiler.h>
+#endif
+
+using namespace std;
+using namespace cv;
+
+bool ready = false;
+bool do_exit = false;
+VideoCapture* cap;
+std::string c_hostname;
+int c_port;
+
+cv::Mat frame;
+
+cv::Rect FR_ROI(0,0,703,703);
+cv::Rect BK_ROI(703,0,703,703);
+
+cv::Mat frame_FR;
+cv::Mat frame_BK;
+
+//boost::mutex mtx;
+std::mutex mtx;
+
+//boost::condition_variable cond;
+std::condition_variable cond;
+
+int height, width;
+int **mapx = NULL, **mapy = NULL;
+
+int rows = 512;
+int cols = 1024;
+
+void free_matrix_int(int ** p)
+{
+    for(int i = 0; i < rows; i++)
+        free(p[i]);
+
+    if(p != NULL) free(p);
+}
+
+void free_matrix_double(double ** p)
+{
+    for(int i = 0; i < rows; i++)
+        free(p[i]);
+
+    if(p != NULL) free(p);
+}
+
+int  ** load_matrix_int(char *fname)
+{
+    FILE *fp;
+    int ret;
+
+    (void)ret;
+
+    int ** tmp = (int **)malloc(rows * sizeof(int *));
+    if(tmp == NULL)
+    {
+        perror("malloc()");
+	return NULL;
+    }
+
+    for(int i = 0; i < rows; i++)
+    {
+        tmp[i] = (int *)malloc(cols * sizeof(int));
+        if(tmp[i] == NULL)
+	{
+	    perror("malloc()");
+	    return NULL;
+	}
+    }
+
+    fp = fopen(fname,"r");
+    if(fp == NULL)
+    {
+        perror("fopen()");
+	free_matrix_int(tmp);
+	return NULL;
+    }
+
+    for(int i = 0; i < rows; i++)
+    {
+        for(int j = 0; j < cols; j++)
+        {
+            ret = fscanf(fp, "%d ", &tmp[i][j]);
+        }
+    }
+
+    if(fp != NULL) fclose(fp);
+
+    return tmp;
+}
+
+double  ** load_matrix_double(char *fname)
+{
+    FILE *fp;
+    int ret;
+
+    (void)ret;
+
+    double ** tmp = (double **)malloc(rows * sizeof(double *));
+    if(tmp == NULL)
+    {
+        perror("malloc()");
+	return NULL;
+    }
+
+    for(int i = 0; i < rows; i++)
+    {
+        tmp[i] = (double *)malloc(cols * sizeof(double));
+        if(tmp[i] == NULL) perror("malloc()");
+    }
+
+    fp = fopen(fname,"r");
+    if(fp == NULL)
+    {
+        perror("fopen()");
+	free_matrix_double(tmp);
+	return NULL;
+    }
+
+    for(int i = 0; i < rows; i++)
+    {
+        for(int j = 0; j < cols; j++)
+        {
+            ret = fscanf(fp, "%lg ", &tmp[i][j]);
+        }
+    }
+
+    if(fp != NULL) fclose(fp);
+
+    return tmp;
+}
+
+void print_matrix_int(int ** p)
+{
+    for(int i = 0; i < rows; i++)
+    {
+        for(int j = 0; j < cols; j++)
+        {
+            cerr << p[i][j] << " ";
+        }
+        cerr << endl;
+    }
+}
+
+void print_matrix_double(double ** p)
+{
+    for(int i = 0; i < rows; i++)
+    {   
+        for(int j = 0; j < cols; j++)
+        {   
+            cerr << p[i][j] << " ";
+        }
+        cerr << endl;
+    }
+}
+
+void captureFunc()
+{
+    char connstr[8192];
+    int ret;
+    
+    (void)ret;
+
+    /* make videocapture params */
+    /* inspired from: https://github.com/opencv/opencv/issues/4506 */
+    std::vector<int> params;
+    params.push_back(cv::CAP_PROP_READ_TIMEOUT_MSEC);
+    params.push_back(500);
+
+    ret = sprintf(connstr,"udp://%s:%d", c_hostname.c_str(), c_port);
+    
+    cap = new VideoCapture(std::string(connstr), cv::CAP_FFMPEG, params);
+    if(!cap)
+    {
+        spdlog::info("failed to establish video capture stream");
+	exit(EXIT_FAILURE);
+    }
+
+    /* if stopReading gets true, we terminate the main frame-reading loop. */
+    //while (!do_exit && cap->isOpened())
+    while(cap->isOpened())
+    {
+	std::unique_lock<std::mutex> lck(mtx);
+
+        if(!ready)
+        {
+            *cap >> frame;
+            
+	    if(frame.empty())
+	    {
+                spdlog::info("received EMPTY frame. Reconnecting...");
+		
+		cap->release();
+		cap = new VideoCapture(connstr, cv::CAP_FFMPEG, params);
+                
+                if(!cap->isOpened())
+		{
+                    perror("VideoCapture() failed. This is possibly due to a WiFI connection going down. Try rerunning program and keep the camera in range.");
+		    exit(EXIT_FAILURE);
+		}
+
+		ready = false;
+                cond.notify_all();
+
+		continue;
+            }
+            
+            ready = true;
+            cond.notify_all();
+        }
+    }
+}
+
+void sendToCB(const std::error_code & ec)
+{
+	spdlog::critical("Error {}", ec.value());
+}
+
+void keepAlive()
+{
+    //std::unique_lock<std::mutex> lck(mtx);
+
+    while(true)
+    {
+        try
+        {
+  	    boost::asio::io_service ioService;
+            boost::asio::ip::udp::resolver resolver(ioService);
+            boost::asio::ip::udp::endpoint dest(boost::asio::ip::address::from_string(c_hostname.c_str()), c_port);
+            boost::asio::ip::udp::socket sock(ioService, boost::asio::ip::udp::v4());
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            sock.async_send_to(boost::asio::buffer("_GPHD_:0:0:2:0.000000\n", 22), dest, boost::bind(&sendToCB, boost::asio::placeholders::error));
+	
+	    spdlog::info("Sent keep-alive message to a Go Pro Max camera listening on {}:{}", c_hostname.c_str(), c_port);
+        }
+        catch (boost::exception& e)
+        {
+	    spdlog::critical("socket errored");
+        }
+    }
+}
+
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    ((std::string *)userp)->append((char *)contents, size*nmemb);
+    return size*nmemb;
+}
+
+Json::Value get_camera_settings()
+{
+    int ret[4];
+    int http_code;
+
+    CURL *curl;
+    CURLcode cres = CURLE_ABORTED_BY_CALLBACK;
+    std::string readBuffer;
+    char triggerurl_buff[8192];
+
+    (void)ret;
+    (void)http_code;
+    (void)cres;
+
+    if(true)
+    {
+    	curl = curl_easy_init();
+        
+	if(curl)
+        {
+	    ret[0] = sprintf(triggerurl_buff,"http://%s/gp/gpControl/status", c_hostname.c_str());
+
+            curl_easy_setopt(curl, CURLOPT_URL, triggerurl_buff);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+
+            cres = curl_easy_perform(curl);
+           
+	    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            curl_easy_cleanup(curl);
+            
+	    std::stringstream ss;
+            ss << readBuffer;
+
+	    Json::Reader reader;
+	    Json::Value completeJsonData;
+
+	    reader.parse(ss, completeJsonData);
+
+	    return completeJsonData;
+	}
+	else
+	{
+            spdlog::error("Aborting run_camera_slam since curl_easy_init() failed");
+	    exit(EXIT_FAILURE);
+	}
+    }
+}
+
+int equirectangular_tracking(const std::shared_ptr<stella_vslam::system>& slam,
+                  	     const std::shared_ptr<stella_vslam::config>& cfg,
+                  	     const unsigned int cam_num,
+                  	     const std::string& mask_img_path,
+                  	     const float scale,
+			     const float stripe_perc,
+                  	     const std::string& map_db_path,
+			     const std::string& save_path,
+			     const bool enable_debug,
+			     const bool enable_ultra_debug,
+                  	     const bool disable_gui) {
+
+    (void)cam_num;
+    (void)scale;
+    (void)save_path;
+    (void)cfg;
+
+    // load the mask image
+    const cv::Mat mask = mask_img_path.empty() ? cv::Mat{} : cv::imread(mask_img_path, cv::IMREAD_GRAYSCALE);
+
+    // create a viewer object
+    // and pass the frame_publisher and the map_publisher
+#ifdef USE_PANGOLIN_VIEWER
+    pangolin_viewer::viewer viewer(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "PangolinViewer"), slam, slam->get_frame_publisher(), slam->get_map_publisher(), enable_debug);
+#elif USE_SOCKET_PUBLISHER
+    socket_publisher::publisher publisher(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "SocketPublisher"), slam, slam->get_frame_publisher(), slam->get_map_publisher());
+#endif
+
+    /* START of open file handler code */
+    int ret[4];
+
+    long long int frame_count = 1;
+
+    char FR_path[8192];
+    char BK_path[8192];
+    char EQ_path[8192];
+
+    struct stat st;
+
+    /* END of open file handler code  */
+
+    std::vector<double> track_times;
+
+    if(save_path != "")
+    {
+	boost::filesystem::create_directories(save_path);
+
+        stat(save_path.c_str(),&st);
+        if(!S_ISDIR(st.st_mode))
+        {
+	    perror("stat(): target save-path directory does not exist");
+	    exit(EXIT_FAILURE);
+        }
+	else
+	{
+            stat(save_path.c_str(),&st);
+	    if(!S_ISDIR(st.st_mode))
+	    {
+                perror("stat(): failed resolving new directory");
+	    }
+            else
+	    {
+		spdlog::info("successfully created directory {}", save_path);
+	    }
+	}
+    }
+
+    assert(stripe_perc >= 0 && stripe_perc <= 1.0);
+
+    // stigger Go Pro MAX camera using libcurl
+    long http_code = 0;
+    int num_try = 0;
+
+    CURL *curl;
+    CURLcode cres = CURLE_ABORTED_BY_CALLBACK;
+    std::string readBuffer;
+    
+    char triggerurl_buff[8192];
+
+    (void)cres;
+
+    do
+    {
+	if(num_try == 3)
+	{
+            spdlog::error("Tried to trigger a Go Pro Max camera listening on {}:{} for 3 consecutive times but failed. Exiting...", c_hostname, c_port);
+	    exit(EXIT_FAILURE);
+	}
+
+        spdlog::info("Triggering a Go Pro Max camera on {}", c_hostname.c_str());
+        (void)cres;
+
+    	curl = curl_easy_init();
+        
+	if(curl)
+        {
+	    bzero(triggerurl_buff, 8192);
+	    ret[0] = sprintf(triggerurl_buff,"http://%s/gp/gpControl/execute?p1=gpStream&c1=restart", c_hostname.c_str());
+
+            curl_easy_setopt(curl, CURLOPT_URL, triggerurl_buff);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+
+            cres = curl_easy_perform(curl);
+           
+	    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            curl_easy_cleanup(curl);
+	}
+	else
+	{
+            spdlog::error("Aborting run_camera_slam since curl_easy_init() failed");
+	    exit(EXIT_FAILURE);
+	}
+        
+	spdlog::info("Camera triggering HTTP request returned a {} status code.", http_code);
+        
+	num_try++;
+    } while(http_code != 200 || cres == CURLE_ABORTED_BY_CALLBACK);
+
+    Json::Value settings = get_camera_settings();
+    
+    //cerr << settings["settings"]["42"] << endl;
+    //cerr.flush();
+
+    std::thread capThread(captureFunc);
+    std::thread keepAliveThread(keepAlive);
+
+    (void)ret;
+    (void)disable_gui;
+
+    // run the slam in another thread
+    std::thread thread([&]() {
+        /* Make double-fisheye-2-equirectangular matrices */
+        double ** map_b = load_matrix_double((char*)"map_b.txt");
+
+        int ** map_x_0 = load_matrix_int((char*)"map_x_b.txt");
+        int ** map_y_0 = load_matrix_int((char*)"map_y_b.txt");
+
+        int ** map_x_1 = load_matrix_int((char*)"map_x_a.txt");
+  	int ** map_y_1 = load_matrix_int((char*)"map_y_a.txt");
+
+        while(true)
+	{	    
+	    std::unique_lock<std::mutex> lock(mtx);
+            while(!ready)
+	    {
+                cond.wait(lock);
+	    }
+
+            if (slam->terminate_is_requested()) {
+	        do_exit = true;
+
+	        break;
+            }
+
+            if(frame.empty())
+            {
+		if(enable_debug)
+		    spdlog::info("equirectangular_tracking() caught empty frame; recatching lock");
+	    }
+	    else
+	    {
+	        frame_FR = frame(FR_ROI);
+	        frame_BK = frame(BK_ROI);
+	
+	        /* dump front/back frames to disk */
+                if(save_path != "" && S_ISDIR(st.st_mode))
+	        {	    
+	            bzero(FR_path, (size_t)8192);
+	            bzero(BK_path, (size_t)8192);
+		
+	            ret[0] = sprintf(FR_path,"%s/frame_FR_%lld.jpg", (char*)save_path.c_str(), frame_count);
+	            ret[1] = sprintf(BK_path,"%s/frame_BK_%lld.jpg", (char*)save_path.c_str(), frame_count);
+	            ret[2] = sprintf(EQ_path,"%s/frame_EQ_%lld.jpg", (char*)save_path.c_str(), frame_count);
+	    
+	            cv::imwrite(std::string(FR_path), frame_FR);
+	            cv::imwrite(std::string(BK_path), frame_BK);
+	        }
+
+                /* computing equirectangular image given the pixel correspondence matrix */
+	        /* computed by fusion2sphere tool for a target equirectangular image of  */
+	        /* 512 pixels on the rows and 1024 pixels on the columns                 */
+
+                cv::Mat frame_equi(512,1024,CV_8UC3);
+
+                int y_lim = ceil((1.0-stripe_perc)*frame_equi.rows);
+
+                for(int i = 0; i < frame_equi.rows; i++)
+                {
+		    for(int j = 0; j < frame_equi.cols; j++)
+		    {
+		        if(y_lim != 0 && i < y_lim)
+		        {
+		            frame_equi.at<cv::Vec3b>(i,j)[0] = (1-map_b[i][j])*frame_BK.at<cv::Vec3b>(map_y_1[i][j],map_x_1[i][j])[0];
+		            frame_equi.at<cv::Vec3b>(i,j)[1] = (1-map_b[i][j])*frame_BK.at<cv::Vec3b>(map_y_1[i][j],map_x_1[i][j])[1];
+		            frame_equi.at<cv::Vec3b>(i,j)[2] = (1-map_b[i][j])*frame_BK.at<cv::Vec3b>(map_y_1[i][j],map_x_1[i][j])[2];
+
+		            frame_equi.at<cv::Vec3b>(i,j)[0] += map_b[i][j]*frame_FR.at<cv::Vec3b>(map_y_0[i][j],map_x_0[i][j])[0];
+		            frame_equi.at<cv::Vec3b>(i,j)[1] += map_b[i][j]*frame_FR.at<cv::Vec3b>(map_y_0[i][j],map_x_0[i][j])[1];
+		            frame_equi.at<cv::Vec3b>(i,j)[2] += map_b[i][j]*frame_FR.at<cv::Vec3b>(map_y_0[i][j],map_x_0[i][j])[2];
+    		        }
+		        else
+		        {
+                            frame_equi.at<cv::Vec3b>(i,j)[0] = 0;
+                            frame_equi.at<cv::Vec3b>(i,j)[1] = 0;
+                            frame_equi.at<cv::Vec3b>(i,j)[2] = 0;
+		        }
+		    }
+	        }
+            
+	        /* dump equirectangular image to disk if requested */
+	        if(save_path != "" && S_ISDIR(st.st_mode))
+	        {
+	            if(enable_ultra_debug)
+		        spdlog::info("equirectangular_tracking() saving equirectangular image in target folder");
+
+	            cv::imwrite(std::string(EQ_path), frame_equi);
+	        }
+
+	        /* feed the equirectangular frame to the SLAM process and time the process */
+                const auto tp_1 = std::chrono::steady_clock::now();
+
+                // input the current frame and estimate the camera pose
+                std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+                double timestamp = std::chrono::duration_cast<std::chrono::duration<double>>(now.time_since_epoch()).count();
+
+	        slam->feed_monocular_frame(frame_equi, timestamp, mask);
+
+                const auto tp_2 = std::chrono::steady_clock::now();
+
+                const auto track_time = std::chrono::duration_cast<std::chrono::duration<double>>(tp_2 - tp_1).count();
+                track_times.push_back(track_time);
+
+	        if(enable_ultra_debug)
+	        {
+                    spdlog::info("equirectangular_tracking() read frame in main thread loop");
+	        }
+
+	        frame_count++;
+            }
+
+	    ready = false;
+	    cond.notify_all();
+	}
+
+    	// wait until the loop BA is finished
+        while (slam->loop_BA_is_running()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(5000));
+        }
+        
+	if(enable_ultra_debug)
+	    spdlog::info("equirectangular_tracking() releasing memory resources");
+
+	free_matrix_double(map_b);
+        free_matrix_int(map_x_0);
+        free_matrix_int(map_y_0);
+        free_matrix_int(map_x_1);
+        free_matrix_int(map_y_1);
+   });
+    
+    if(!disable_gui)
+    //if(enable_debug)
+    //if(true)
+    {
+        // run the viewer in the current thread
+#ifdef USE_PANGOLIN_VIEWER
+        viewer.run();
+#elif USE_SOCKET_PUBLISHER
+        publisher.run();
+#endif
+    }
+
+    thread.join();
+ 
+    keepAliveThread.join();
+ 
+    capThread.join();
+ 
+    // shutdown the slam process
+    slam->shutdown();
+ 
+    std::sort(track_times.begin(), track_times.end());
+    const auto total_track_time = std::accumulate(track_times.begin(), track_times.end(), 0.0);
+    std::cout << "median tracking time: " << track_times.at(track_times.size() / 2) << "[s]" << std::endl;
+    std::cout << "mean tracking time: " << total_track_time / track_times.size() << "[s]" << std::endl;
+
+    if (!map_db_path.empty()) {
+        if (!slam->save_map_database(map_db_path)) {
+            return EXIT_FAILURE;
+        }
+	spdlog::info("map database saved under {}", map_db_path);
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
+                  const std::shared_ptr<stella_vslam::config>& cfg,
+                  const unsigned int cam_num,
+                  const std::string& mask_img_path,
+                  const float scale,
+                  const std::string& map_db_path,
+                  const bool disable_gui) {
+
+    (void)cfg;
+
+    // load the mask image
+    const cv::Mat mask = mask_img_path.empty() ? cv::Mat{} : cv::imread(mask_img_path, cv::IMREAD_GRAYSCALE);
+
+    // create a viewer object
+    // and pass the frame_publisher and the map_publisher
+#ifdef USE_PANGOLIN_VIEWER
+    pangolin_viewer::viewer viewer(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "PangolinViewer"), slam, slam->get_frame_publisher(), slam->get_map_publisher(), disable_gui);
+#elif USE_SOCKET_PUBLISHER
+    socket_publisher::publisher publisher(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "SocketPublisher"), slam, slam->get_frame_publisher(), slam->get_map_publisher());
+#endif
+
+    auto video = cv::VideoCapture(cam_num);
+    if (!video.isOpened()) {
+        spdlog::critical("cannot open a camera {}", cam_num);
+        slam->shutdown();
+        return EXIT_FAILURE;
+    }
+
+    cv::Mat frame;
+    std::vector<double> track_times;
+
+    bool is_not_end = true;
+    long long int num_frame = 0;
+
+    // run the slam in another thread
+    std::thread thread([&]() {
+        while (is_not_end) {
+            // check if the termination of slam system is requested or not
+            if (slam->terminate_is_requested()) {
+                break;
+            }
+
+            is_not_end = video.read(frame);
+            if (frame.empty()) {
+                continue;
+            }
+            if (scale != 1.0) {
+                cv::resize(frame, frame, cv::Size(), scale, scale, cv::INTER_LINEAR);
+            }
+
+            const auto tp_1 = std::chrono::steady_clock::now();
+
+            // input the current frame and estimate the camera pose
+            std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+            double timestamp = std::chrono::duration_cast<std::chrono::duration<double>>(now.time_since_epoch()).count();
+            slam->feed_monocular_frame(frame, timestamp, mask);
+
+            const auto tp_2 = std::chrono::steady_clock::now();
+
+            const auto track_time = std::chrono::duration_cast<std::chrono::duration<double>>(tp_2 - tp_1).count();
+            track_times.push_back(track_time);
+
+            ++num_frame;
+        }
+
+        // wait until the loop BA is finished
+        while (slam->loop_BA_is_running()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(5000));
+        }
+    });
+
+    if (!disable_gui) {
+        // run the viewer in the current thread
+#ifdef USE_PANGOLIN_VIEWER
+        viewer.run();
+#elif USE_SOCKET_PUBLISHER
+        publisher.run();
+#endif
+    }
+
+    thread.join();
+
+    // shutdown the slam process
+    slam->shutdown();
+
+    std::sort(track_times.begin(), track_times.end());
+    const auto total_track_time = std::accumulate(track_times.begin(), track_times.end(), 0.0);
+    std::cout << "median tracking time: " << track_times.at(track_times.size() / 2) << "[s]" << std::endl;
+    std::cout << "mean tracking time: " << total_track_time / track_times.size() << "[s]" << std::endl;
+
+    if (!map_db_path.empty()) {
+        if (!slam->save_map_database(map_db_path)) {
+            return EXIT_FAILURE;
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+
+int stereo_tracking(const std::shared_ptr<stella_vslam::system>& slam,
+                    const std::shared_ptr<stella_vslam::config>& cfg,
+                    const unsigned int cam_num,
+                    const std::string& mask_img_path,
+                    const float scale,
+                    const std::string& map_db_path,
+                    const bool disable_gui) {
+    const cv::Mat mask = mask_img_path.empty() ? cv::Mat{} : cv::imread(mask_img_path, cv::IMREAD_GRAYSCALE);
+
+    // create a viewer object
+    // and pass the frame_publisher and the map_publisher
+#ifdef USE_PANGOLIN_VIEWER
+    pangolin_viewer::viewer viewer(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "PangolinViewer"), slam, slam->get_frame_publisher(), slam->get_map_publisher(), disable_gui);
+#elif USE_SOCKET_PUBLISHER
+    socket_publisher::publisher publisher(
+        stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "SocketPublisher"), slam, slam->get_frame_publisher(), slam->get_map_publisher());
+#endif
+
+    cv::VideoCapture videos[2];
+    for (int i = 0; i < 2; i++) {
+        videos[i] = cv::VideoCapture(cam_num + i);
+        if (!videos[i].isOpened()) {
+            spdlog::critical("cannot open a camera {}", cam_num + i);
+            slam->shutdown();
+            return EXIT_FAILURE;
+        }
+    }
+
+    const stella_vslam::util::stereo_rectifier rectifier(cfg, slam->get_camera());
+
+    cv::Mat frames[2];
+    cv::Mat frames_rectified[2];
+    std::vector<double> track_times;
+    unsigned int num_frame = 0;
+
+    bool is_not_end = true;
+    // run the slam in another thread
+    std::thread thread([&]() {
+        while (is_not_end) {
+            // check if the termination of slam system is requested or not
+            if (slam->terminate_is_requested()) {
+                break;
+            }
+
+            is_not_end = videos[0].read(frames[0]) && videos[1].read(frames[1]);
+            if (frames[0].empty() || frames[1].empty()) {
+                continue;
+            }
+            for (int i = 0; i < 2; i++) {
+                if (scale != 1.0) {
+                    cv::resize(frames[i], frames[i], cv::Size(), scale, scale, cv::INTER_LINEAR);
+                }
+            }
+            rectifier.rectify(frames[0], frames[1], frames_rectified[0], frames_rectified[1]);
+
+            const auto tp_1 = std::chrono::steady_clock::now();
+
+            // input the current frame and estimate the camera pose
+            std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+            double timestamp = std::chrono::duration_cast<std::chrono::duration<double>>(now.time_since_epoch()).count();
+            slam->feed_stereo_frame(frames_rectified[0], frames_rectified[1], timestamp, mask);
+
+            const auto tp_2 = std::chrono::steady_clock::now();
+
+            const auto track_time = std::chrono::duration_cast<std::chrono::duration<double>>(tp_2 - tp_1).count();
+            track_times.push_back(track_time);
+
+            ++num_frame;
+        }
+
+        // wait until the loop BA is finished
+        while (slam->loop_BA_is_running()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(5000));
+        }
+    });
+
+    if (!disable_gui) {
+        // run the viewer in the current thread
+#ifdef USE_PANGOLIN_VIEWER
+        viewer.run();
+#elif USE_SOCKET_PUBLISHER
+        publisher.run();
+#endif
+    }
+
+    thread.join();
+
+    // shutdown the slam process
+    slam->shutdown();
+
+    std::sort(track_times.begin(), track_times.end());
+    const auto total_track_time = std::accumulate(track_times.begin(), track_times.end(), 0.0);
+    std::cout << "median tracking time: " << track_times.at(track_times.size() / 2) << "[s]" << std::endl;
+    std::cout << "mean tracking time: " << total_track_time / track_times.size() << "[s]" << std::endl;
+
+    if (!map_db_path.empty()) {
+        if (!slam->save_map_database(map_db_path)) {
+            return EXIT_FAILURE;
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+int main(int argc, char* argv[]) {
+#ifdef USE_STACK_TRACE_LOGGER
+    backward::SignalHandling sh;
+#endif
+
+    // create options
+    popl::OptionParser op("Allowed options");
+    auto help = op.add<popl::Switch>("h", "help", "produce help message");
+    auto vocab_file_path = op.add<popl::Value<std::string>>("v", "vocab", "vocabulary file path");
+    auto cam_num = op.add<popl::Value<unsigned int>>("n", "number", "camera number");
+    auto config_file_path = op.add<popl::Value<std::string>>("c", "config", "config file path");
+    auto mask_img_path = op.add<popl::Value<std::string>>("", "mask", "mask image path", "");
+    auto scale = op.add<popl::Value<float>>("s", "scale", "scaling ratio of images", 1.0);
+    auto stripe_perc = op.add<popl::Value<float>>("P", "stripeblack", "draw a black rectangle at the bottom %%S ratio of the pixels (default: 0)", 0.0);
+    auto map_db_path_in = op.add<popl::Value<std::string>>("i", "map-db-in", "load a map from this path", "");
+    auto map_db_path_out = op.add<popl::Value<std::string>>("o", "map-db-out", "store a map database at this path after slam", "");
+    auto log_level = op.add<popl::Value<std::string>>("", "log-level", "log level", "info");
+    auto disable_mapping = op.add<popl::Switch>("", "disable-mapping", "disable mapping");
+    auto temporal_mapping = op.add<popl::Switch>("", "temporal-mapping", "enable temporal mapping");
+    auto disable_gui = op.add<popl::Value<bool>>("G", "disable-gui", "run without GUI", false);
+    auto save_path = op.add<popl::Value<std::string>>("Q", "savepath", "define save path for equirectangular images","");
+    auto enable_debug = op.add<popl::Value<bool>>("d", "debug", "allow debug messages in equirectangular frame processing", true);
+    auto enable_ultra_debug = op.add<popl::Value<bool>>("U", "ultradebug", "allow ultra debug messages in equirectangular processing", false);
+    auto use_gpmax = op.add<popl::Implicit<bool>>("M", "usegopromax", "connect to a GoPro Max camera via WiFi", true);
+    auto hostname = op.add<popl::Value<std::string>>("H", "hostname", "hostname or IP address of GoPro Max camera", "10.5.5.9");
+    auto port = op.add<popl::Value<int>>("p", "portnumber", "port number of the GoPro Max", 8554);
+
+    try {
+        op.parse(argc, argv);
+    }
+    catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        std::cerr << std::endl;
+        std::cerr << op << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    // check validness of options
+    if (help->is_set()) {
+        std::cerr << op << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!op.unknown_options().empty()) {
+        for (const auto& unknown_option : op.unknown_options()) {
+            std::cerr << "unknown_options: " << unknown_option << std::endl;
+        }
+        std::cerr << op << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!vocab_file_path->is_set() || !cam_num->is_set()
+        || !config_file_path->is_set()) {
+        std::cerr << "invalid arguments" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << op << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    // setup logger
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] %^[%L] %v%$");
+    spdlog::set_level(spdlog::level::from_str(log_level->value()));
+
+    // load configuration
+    std::shared_ptr<stella_vslam::config> cfg;
+    try {
+        cfg = std::make_shared<stella_vslam::config>(config_file_path->value());
+    }
+    catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+
+#ifdef USE_GOOGLE_PERFTOOLS
+    ProfilerStart("slam.prof");
+#endif
+
+    // build a slam system
+    auto slam = std::make_shared<stella_vslam::system>(cfg, vocab_file_path->value());
+    bool need_initialize = true;
+    
+    if (map_db_path_in->is_set()) {
+        need_initialize = false;
+        const auto path = fs::path(map_db_path_in->value());
+        if (path.extension() == ".yaml") {
+            YAML::Node node = YAML::LoadFile(path);
+            for (const auto& map_path : node["maps"].as<std::vector<std::string>>()) {
+                if (!slam->load_map_database(path.parent_path() / map_path)) {
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+        else {
+            if (!slam->load_map_database(path)) {
+                return EXIT_FAILURE;
+            }
+        }
+    }
+    slam->startup(need_initialize);
+    if (disable_mapping->is_set()) {
+        slam->disable_mapping_module();
+    }
+    else if (temporal_mapping->is_set()) {
+        slam->enable_temporal_mapping();
+        slam->disable_loop_detector();
+    }
+
+    // run tracking
+    int ret;
+    if (use_gpmax->value() == true) {
+        c_hostname = hostname->value();
+	c_port = port->value();
+
+   	ret = equirectangular_tracking(slam,
+                                       cfg,
+                                       cam_num->value(),
+                                       mask_img_path->value(),
+                                       scale->value(),
+				       stripe_perc->value(),
+                                       map_db_path_out->value(),
+				       save_path->value(),
+				       enable_debug->value(),
+				       enable_ultra_debug->value(),
+                                       disable_gui->value());
+    }
+    else if (slam->get_camera()->setup_type_ == stella_vslam::camera::setup_type_t::Monocular)
+    {
+        ret = mono_tracking(slam,
+                            cfg,
+                            cam_num->value(),
+                            mask_img_path->value(),
+                            scale->value(),
+                            map_db_path_out->value(),
+                            disable_gui->value());
+    }
+    else if (slam->get_camera()->setup_type_ == stella_vslam::camera::setup_type_t::Stereo) {
+        ret = stereo_tracking(slam,
+                              cfg,
+                              cam_num->value(),
+                              mask_img_path->value(),
+                              scale->value(),
+                              map_db_path_out->value(),
+                              disable_gui->value());
+    } else {
+        throw std::runtime_error("Invalid setup type: " + slam->get_camera()->get_setup_type_string());
+    }
+
+#ifdef USE_GOOGLE_PERFTOOLS
+    ProfilerStop();
+#endif
+    
+    spdlog::info("quitting run_camera_slam");
+    return ret;
+}
