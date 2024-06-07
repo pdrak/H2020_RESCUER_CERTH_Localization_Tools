@@ -1,0 +1,25 @@
+#!/bin/bash
+################################
+### CERTH Drakoulis, Karavarsamis
+################################
+
+# IMPORTANT!: There is a discrepancy between DOS and UNIX carriage return (\r). This script must be UNIX encoded. e.g. Notepad++: Edit>EOL Conversion>Unix (LF)
+
+export EXTERNALIP=`curl http://ifconfig.me/ip`
+
+echo "*****************************"
+echo "** YOU ARE INSIDE: exec.sh"
+echo "** USER: " $(whoami)
+echo "** PWD: " $(pwd)
+echo "** LS: " $(ls)
+echo "** EXTERNAL IP: $EXTERNALIP"
+echo "** DISPLAY: $DISPLAY"
+echo "*****************************"
+
+# EXECUTE WHATEVER YOU WISH
+
+python3 /code/proxycam.py --host_ip $HOST_IP --camera_ip $CAMERA_IP --camera_port $CAMERA_PORT --forward_port_1 $FORWARD_PORT_1 --forward_port_2 $FORWARD_PORT_2 --cmds $CMDS
+
+# PREVENT DOCKER FROM EXITING
+echo "END EXEC!"
+tail -f /dev/null
