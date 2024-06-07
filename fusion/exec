@@ -1,0 +1,24 @@
+#!/bin/bash
+################################
+### CERTH Drakoulis, Karavarsamis
+################################
+
+# IMPORTANT!: There is a discrepancy between DOS and UNIX carriage return (\r). This script must be UNIX encoded. e.g. Notepad++: Edit>EOL Conversion>Unix (LF)
+
+export EXTERNALIP=`curl http://ifconfig.me/ip`
+
+echo "*****************************"
+echo "** YOU ARE INSIDE: exec.sh"
+echo "** USER: " $(whoami)
+echo "** PWD: " $(pwd)
+echo "** LS: " $(ls)
+echo "** EXTERNAL IP: $EXTERNALIP"
+echo "** DISPLAY: $DISPLAY"
+echo "*****************************"
+
+# EXECUTE WHATEVER YOU WISH
+python3 /code/fusion_main.py --broker_ip $BROKER_IP --time_window $TIME_WINDOW --gal_qual $GAL_QUAL --vis_qual $VIS_QUAL --ine_qual $INE_QUAL --use_gal $USE_GAL --use_vis $USE_VIS --use_ine $USE_INE --from_tool $FROM_TOOL 
+
+# PREVENT DOCKER FROM EXITING
+echo "END EXEC!"
+tail -f /dev/null
