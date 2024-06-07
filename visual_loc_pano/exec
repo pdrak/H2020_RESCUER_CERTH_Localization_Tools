@@ -1,0 +1,154 @@
+#!/bin/bash
+################################
+### CERTH Drakoulis, Karavarsamis
+################################
+
+# IMPORTANT!: There is a discrepancy between DOS and UNIX carriage return (\r). This script must be UNIX encoded. e.g. Notepad++: Edit>EOL Conversion>Unix (LF)
+
+export EXTERNALIP=`curl http://ifconfig.me/ip`
+
+echo "*****************************"
+echo "** YOU ARE INSIDE: exec.sh"
+echo "** USER: " $(whoami)
+echo "** PWD: " $(pwd)
+echo "** LS: " $(ls)
+echo "** EXTERNAL IP: $EXTERNALIP"
+echo "** DISPLAY: $DISPLAY"
+echo "*****************************"
+
+# EXECUTE WHATEVER YOU WISH
+service dbus start
+service bluetooth start
+
+cp /tmp/stella_vslam/build/*.txt ./
+
+# variables of common settings
+MAX_YAML="/tmp/stella_vslam/example/aist/equirectangular.yaml"
+HERO_YAML="/tmp/stella_vslam/example/rescuer/calib_360.yaml"
+MAX_IP_ADDR="10.5.5.9"
+HERO_IP_ADDR="172.21.134.51"
+GOPRO_MAX_PORT=8554
+DEBUG_ON=1
+DISABLE_GUI=0
+DEFAULT_CAM=0
+
+ORB_VOCAB="/tmp/stella_vslam/build/orb_vocab.fbow"
+
+if [ "$MODE" = "MAP" ]; then
+    echo "IN MODE: MAP"
+    
+    rm /tpf_unix_sock.server
+
+    if [ "$CAMERA_TYPE" = "GOPRO_MAX" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $MAX_YAML -P 0.0 -d $DEBUG_ON -M -H $MAX_IP_ADDR -p $GOPRO_MAX_PORT -s $MAX_SCALE_FACTOR --map-db-out "/tmp/stella_vslam/build/map.msg" -S "/tpf_unix_sock.server" &
+    
+    elif [ "$CAMERA_TYPE" = "GOPRO_HERO10" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $HERO_YAML -P 0.0 -d $DEBUG_ON -W -H $HERO_IP_ADDR -p $CAMERA_PORT -s $HERO_SCALE_FACTOR --map-db-out "/tmp/stella_vslam/build/map.msg" -S "/tpf_unix_sock.server" &
+    fi
+
+    python3 /code/run_readcamera_poses.py --socket_path "/tpf_unix_sock.server"
+
+elif [ "$MODE" = "USE_MAP" ]; then
+    echo "IN MODE: USE_MAP"s
+
+    if [ "$CAMERA_TYPE" = "GOPRO_MAX" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $MAX_YAML -P 0.0 -d $DEBUG_ON -M -H $MAX_IP_ADDR -p $GOPRO_MAX_PORT -s $MAX_SCALE_FACTOR --disable-mapping --map-db-in "/home/rescuer/Desktop/visual_loc_pano/map.msg" &
+	export WHICH_CAMERA="max"
+
+    elif [ "$CAMERA_TYPE" = "GOPRO_HERO10" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $HERO_YAML -P 0.0 -d $DEBUG_ON -W -H $HERO_IP_ADDR -p $CAMERA_PORT -s $HERO_SCALE_FACTOR --disable-mapping --map-db-in "/home/rescuer/Desktop/visual_loc_pano/map.msg" &
+	export WHICH_CAMERA="hero"
+    fi
+
+    python3 /code/outer_slam_pano.py \
+    --debug \
+    --cap_fps $CAP_FPS \
+    --output_dir "/out" \
+    --broker_ip $BROKER_IP \
+    --which_camera $WHICH_CAMERA \
+    --socket_path "/tpf_unix_sock.server" \
+    --qr1_lat $QR1_LAT \
+    --qr1_lon $QR1_LON \
+    --qr1_alt $QR1_ALT \
+    --qr2_lat $QR2_LAT \
+    --qr2_lon $QR2_LON \
+    --qr2_alt $QR2_ALT \
+    --qr3_lat $QR3_LAT \
+    --qr3_lon $QR3_LON \
+    --qr3_alt $QR3_ALT \
+    --map "/home/rescuer/Desktop/visual_loc_pano/map.msg" \
+    --glt_calib $GLT_CALIB
+
+elif [ "$MODE" = "USE_MAP_CALIBRATED" ]; then
+    if [ "$LAZY_START" = "True" ]; then
+        python3 /code/lazy_start.py
+    fi
+
+    echo "IN MODE: USE_MAP_CALIBRATED"
+
+    if [ "$CAMERA_TYPE" = "GOPRO_MAX" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $MAX_YAML -P 0.0 -d $DEBUG_ON -M -H $MAX_IP_ADDR -p $GOPRO_MAX_PORT -s $MAX_SCALE_FACTOR --disable-mapping --map-db-in "/home/rescuer/Desktop/visual_loc_pano/map.msg" &
+	export WHICH_CAMERA="max"
+
+    elif [ "$CAMERA_TYPE" = "GOPRO_HERO10" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $HERO_YAML -P 0.0 -d $DEBUG_ON -W -H $HERO_IP_ADDR -p $CAMERA_PORT -s $HERO_SCALE_FACTOR --disable-mapping --map-db-in "/home/rescuer/Desktop/visual_loc_pano/map.msg" &
+	export WHICH_CAMERA="hero"
+    fi
+
+    python3 /code/outer_slam_pano.py \
+    --debug \
+    --cap_fps $CAP_FPS \
+    --output_dir "/out" \
+    --broker_ip $BROKER_IP \
+    --which_camera $WHICH_CAMERA \
+    --socket_path "/tpf_unix_sock.server" \
+    --qr1_lat $QR1_LAT \
+    --qr1_lon $QR1_LON \
+    --qr1_alt $QR1_ALT \
+    --qr2_lat $QR2_LAT \
+    --qr2_lon $QR2_LON \
+    --qr2_alt $QR2_ALT \
+    --qr3_lat $QR3_LAT \
+    --qr3_lon $QR3_LON \
+    --qr3_alt $QR3_ALT \
+    --map "/home/rescuer/Desktop/visual_loc_pano/map.msg" \
+    --calibrated "/home/rescuer/Desktop/visual_loc_pano/local_points.txt"
+
+elif [ "$MODE" = "LOC_ONESHOT" ]; then
+    if [ "$LAZY_START" = "True" ]; then
+        python3 /code/lazy_start.py
+    fi
+
+    echo "IN MODE: LOC_ONESHOT"
+
+    if [ "$CAMERA_TYPE" = "GOPRO_MAX" ]; then
+        ./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $MAX_YAML -P 0.0 -d $DEBUG_ON -M -H $MAX_IP_ADDR -p $GOPRO_MAX_PORT -s $MAX_SCALE_FACTOR & 
+        export WHICH_CAMERA="max"
+
+    elif [ "$CAMERA_TYPE" = "GOPRO_HERO10" ]; then
+	./tmp/stella_vslam/build/run_camera_slam -v $ORB_VOCAB -G $DISABLE_GUI -n $DEFAULT_CAM -c $HERO_YAML -P 0.0 -d $DEBUG_ON -W -H $HERO_IP_ADDR -p $CAMERA_PORT -s $HERO_SCALE_FACTOR &
+        export WHICH_CAMERA="hero"
+    fi
+
+    python3 /code/outer_slam_pano.py \
+    --debug \
+    --cap_fps $CAP_FPS \
+    --output_dir "/out" \
+    --broker_ip $BROKER_IP \
+    --which_camera $WHICH_CAMERA \
+    --socket_path "/tpf_unix_sock.server" \
+    --qr1_lat $QR1_LAT \
+    --qr1_lon $QR1_LON \
+    --qr1_alt $QR1_ALT \
+    --qr2_lat $QR2_LAT \
+    --qr2_lon $QR2_LON \
+    --qr2_alt $QR2_ALT \
+    --qr3_lat $QR3_LAT \
+    --qr3_lon $QR3_LON \
+    --qr3_alt $QR3_ALT \
+    --glt_calib $GLT_CALIB
+fi
+
+# PREVENT DOCKER FROM EXITING
+echo "END EXEC!"
+tail -f /dev/null
